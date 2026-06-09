@@ -21,6 +21,21 @@ from .signals import Signal, SignalEngine
 from .tokens import ELIGIBLE_TOKENS, registry
 
 
+TRADE_WINDOWS: dict[str, tuple[int, int]] = {
+    "morning": (0, 8),
+    "afternoon": (8, 16),
+    "night": (16, 24),
+}
+
+
+def trade_window(now: datetime) -> str:
+    hour = now.astimezone(timezone.utc).hour
+    for name, (start, end) in TRADE_WINDOWS.items():
+        if start <= hour < end:
+            return name
+    return "night"
+
+
 class ReasoningLayer:
     async def explain(self, signal: Signal, alternatives: list[Signal]) -> str:
         prompt = (
@@ -71,6 +86,8 @@ class FidelRuntime:
         self.execution_preview: dict[str, Any] = {}
         self.activity: list[str] = []
         self.daily_trade_count: dict[str, int] = {}
+        self.daily_window_trades: dict[str, dict[str, int]] = {}
+        self._last_activity_by_key: dict[str, str] = {}
         self.last_error = ""
         self._task: asyncio.Task | None = None
         self._clients: set[WebSocket] = set()
@@ -95,7 +112,7 @@ class FidelRuntime:
     async def emergency_stop(self, reason: str = "manual emergency stop") -> None:
         self.status = "STOPPED"
         self.portfolio.stopped = True
-        self.activity.insert(0, f"{datetime.now(timezone.utc).isoformat()} EMERGENCY STOP: {reason}")
+        self._log_activity("emergency_stop", f"EMERGENCY STOP: {reason}", force=True)
         self.logger.log_event("CRITICAL", "emergency stop activated", {"reason": reason})
         if self._task:
             self._task.cancel()
@@ -121,13 +138,15 @@ class FidelRuntime:
         prices = {s.symbol: s.price for s in self.top_signals}
         self.portfolio.mark_to_market(prices)
         if not self.top_signals:
-            self.activity.insert(0, f"{datetime.now(timezone.utc).isoformat()} No CMC signals available")
+            self._log_activity("cmc_feed", "No CMC signals available")
             return
         now = datetime.now(timezone.utc)
-        in_competition_week = now.date().isoformat() >= "2026-06-22" and now.date().isoformat() <= "2026-06-28"
-        if in_competition_week and now.hour >= 20 and self.daily_trade_count.get(now.date().isoformat(), 0) == 0:
-            self.activity.insert(0, f"{now.isoformat()} Daily trade requirement alert: no qualifying trade recorded by 20:00 UTC")
-            self.logger.log_event("WARNING", "daily trade requirement alert", {"date": now.date().isoformat()})
+        day = now.date().isoformat()
+        window = trade_window(now)
+        in_competition_week = "2026-06-22" <= day <= "2026-06-28"
+        if in_competition_week and now.hour >= 20 and self.daily_trade_count.get(day, 0) == 0:
+            if self._log_activity(f"daily_trade_alert:{day}", "Daily trade requirement alert: no qualifying trade recorded by 20:00 UTC"):
+                self.logger.log_event("WARNING", "daily trade requirement alert", {"date": day})
         selected = self.top_signals[0]
         selected.reasoning = await self.reasoning.explain(selected, self.top_signals[1:])
         decision = self.risk.evaluate(selected, self.portfolio)
@@ -135,16 +154,28 @@ class FidelRuntime:
             self.execution_preview = asdict(self.executor.preview_swap(selected, decision))
         else:
             self.execution_preview = {"approved": False, "warnings": [decision.reason], "venue": "none"}
-        self.activity.insert(0, f"{datetime.now(timezone.utc).isoformat()} {selected.symbol} {selected.direction} {selected.confidence}%: {decision.reason}")
+        self._log_activity("trade_decision", f"{selected.symbol} {selected.direction} {selected.confidence}% {selected.strength} in {window}: {decision.reason}")
         if not decision.approved:
             self.logger.log_event("INFO", "trade rejected by risk layer", {"symbol": selected.symbol, "reason": decision.reason})
             return
+        if not self._window_trade_available(day, window):
+            reason = f"{window} UTC trade window already used for {day}; waiting for next window"
+            self.execution_preview = {"approved": False, "warnings": [reason], "venue": "window throttle"}
+            self._log_activity(f"window_throttle:{day}:{window}", reason)
+            self.logger.log_event("INFO", "trade rejected by window throttle", {"date": day, "window": window, "symbol": selected.symbol})
+            return
         before = self.portfolio.value
         result = await self.executor.execute_swap(selected, decision, self.portfolio)
+        if result.status not in {"confirmed", "submitted"}:
+            reason = f"Execution rejected for {selected.symbol}: {result.message}"
+            self.execution_preview = {"approved": False, "warnings": [reason], "venue": "execution"}
+            self._log_activity("execution_rejected", reason)
+            self.logger.log_event("WARNING", "execution rejected", {"symbol": selected.symbol, "message": result.message})
+            return
         self.executor.apply_fill(selected, decision, result, self.portfolio)
         after = self.portfolio.value
-        day = datetime.now(timezone.utc).date().isoformat()
-        self.daily_trade_count[day] = self.daily_trade_count.get(day, 0) + 1
+        self._record_window_trade(day, window)
+        self._log_activity(f"trade_fill:{day}:{window}", f"Executed {selected.direction} {selected.symbol} in {window} window: {result.tx_hash}", force=True)
         self.logger.log_trade(
             {
                 "utc_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -169,6 +200,22 @@ class FidelRuntime:
                 "cmc_data_snapshot": selected.cmc_snapshot,
             }
         )
+
+    def _window_trade_available(self, day: str, window: str) -> bool:
+        return self.daily_window_trades.get(day, {}).get(window, 0) < 1
+
+    def _record_window_trade(self, day: str, window: str) -> None:
+        windows = self.daily_window_trades.setdefault(day, {})
+        windows[window] = windows.get(window, 0) + 1
+        self.daily_trade_count[day] = sum(windows.values())
+
+    def _log_activity(self, key: str, message: str, *, force: bool = False) -> bool:
+        if not force and self._last_activity_by_key.get(key) == message:
+            return False
+        self._last_activity_by_key[key] = message
+        self.activity.insert(0, f"{datetime.now(timezone.utc).isoformat()} {message}")
+        self.activity = self.activity[:200]
+        return True
 
     def dashboard(self) -> dict[str, Any]:
         value = self.portfolio.value
@@ -202,6 +249,7 @@ class FidelRuntime:
             "trades": trades,
             "activity": self.activity[:80],
             "daily_trade_count": self.daily_trade_count,
+            "daily_window_trades": self.daily_window_trades,
             "today_trades": self.daily_trade_count.get(today, 0),
             "win_rate": round(len(wins) / len(closed) * 100, 2) if closed else 0,
             "fear_greed": self.top_signals[0].cmc_snapshot.get("fear_greed", 50) if self.top_signals else 50,

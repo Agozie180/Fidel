@@ -112,6 +112,8 @@ class RiskManager:
             return RiskDecision(False, "3 consecutive losses; pausing 30 minutes", warning="LOSS_STREAK")
         if len(portfolio.positions) >= 3:
             return RiskDecision(False, "maximum 3 open positions already reached")
+        if signal.strength not in {"STRONG", "EXTREME"}:
+            return RiskDecision(False, "signal strength must be STRONG or EXTREME")
         if not signal.executable:
             return RiskDecision(False, "signal is not strong enough for autonomous execution")
         liquidity_score = int(signal.cmc_snapshot.get("liquidity_score", 0))
