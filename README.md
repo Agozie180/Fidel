@@ -10,7 +10,7 @@ Fidel is a professional autonomous AI trading agent web application for BNB Hack
 - Only eligible BEP-20 symbols in `backend/signals.py` are allowed. Unknown tokens are rejected before execution.
 - For live mode, set `STRICT_LIVE_TOKEN_CONTRACTS=true` and provide `ELIGIBLE_TOKEN_REGISTRY_PATH` with BSC contract addresses. Symbol-only validation is not enough for real competition execution.
 - Hard drawdown cap defaults to 25%. At or above the cap Fidel stops all trading.
-- Maximum position size defaults to 2% of portfolio.
+- Maximum position size defaults to 10% of portfolio.
 - Daily loss limit defaults to 5%.
 - Minimum one trade per UTC day is tracked on the dashboard.
 - Live mode fails closed if CMC, TWAK, BSC, or signing configuration is unavailable.
