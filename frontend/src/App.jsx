@@ -4,8 +4,21 @@ import { Activity, AlertTriangle, CheckCircle2, Download, Gauge, Moon, Pause, Pl
 import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import "./styles.css";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
-const WS = API.replace("http", "ws") + "/ws";
+// Resolve the backend base URL at build time. In a deployed build VITE_API_URL
+// must be set (see frontend/.env.production); if it is missing we fall back to
+// the page's own origin in production - never to localhost, which only exists
+// on a developer's machine and leaves visitors stuck on the loading screen.
+function resolveApiBase() {
+  const configured = import.meta.env.VITE_API_URL;
+  if (configured && configured.trim()) return configured.trim().replace(/\/$/, "");
+  if (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+    return window.location.origin; // same-origin deploy fallback
+  }
+  return "http://localhost:8000"; // local dev default
+}
+
+const API = resolveApiBase();
+const WS = API.replace(/^http/, "ws") + "/ws";
 
 function money(value) {
   return `$${Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
@@ -17,20 +30,52 @@ function pct(value) {
 
 function App() {
   const [state, setState] = useState(null);
+  const [error, setError] = useState("");
+  const [attempt, setAttempt] = useState(0);
   const [theme, setTheme] = useState(() => localStorage.getItem("fidel-theme") || "professional");
 
   useEffect(() => {
-    fetch(`${API}/api/state`).then((r) => r.json()).then(setState).catch(() => {});
-    const socket = new WebSocket(WS);
-    socket.onmessage = (event) => setState(JSON.parse(event.data));
+    let cancelled = false;
+
+    async function pull() {
+      try {
+        const res = await fetch(`${API}/api/state`);
+        if (!res.ok) throw new Error(`backend responded ${res.status}`);
+        const data = await res.json();
+        if (!cancelled) {
+          setState(data);
+          setError("");
+        }
+      } catch (err) {
+        // Surface the failure instead of hanging on the loading screen forever.
+        if (!cancelled && !state) setError(err?.message || "could not reach backend");
+      }
+    }
+
+    pull(); // immediate fetch so we never wait on the WebSocket handshake
+    let socket;
+    try {
+      socket = new WebSocket(WS);
+      socket.onmessage = (event) => {
+        if (!cancelled) {
+          setState(JSON.parse(event.data));
+          setError("");
+        }
+      };
+    } catch {
+      /* WebSocket constructor can throw on a bad URL; HTTP polling still covers us. */
+    }
+
     const timer = setInterval(() => {
-      if (socket.readyState !== 1) fetch(`${API}/api/state`).then((r) => r.json()).then(setState).catch(() => {});
+      if (!socket || socket.readyState !== 1) pull();
     }, 5000);
+
     return () => {
+      cancelled = true;
       clearInterval(timer);
-      socket.close();
+      if (socket) socket.close();
     };
-  }, []);
+  }, [attempt]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -49,7 +94,26 @@ function App() {
     return res;
   }
 
-  if (!state) return <div className="boot">Fidel is loading market telemetry...</div>;
+  if (!state) {
+    return (
+      <div className="boot">
+        {error ? (
+          <div className="bootError">
+            <AlertTriangle size={28} />
+            <h2>Can't reach the Fidel backend</h2>
+            <p>{error}</p>
+            <p className="bootUrl">Trying: <code>{API}</code></p>
+            <p className="bootHint">
+              If this URL is wrong, set <code>VITE_API_URL</code> to your backend's public URL and rebuild the frontend.
+            </p>
+            <button onClick={() => { setError(""); setAttempt((n) => n + 1); }}>Retry</button>
+          </div>
+        ) : (
+          <span>Fidel is loading market telemetry…</span>
+        )}
+      </div>
+    );
+  }
   const dd = state.portfolio.drawdown_pct;
   const ddClass = dd >= 20 ? "danger" : dd >= 15 ? "warn" : "ok";
 

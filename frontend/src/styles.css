@@ -66,7 +66,14 @@ button, a.download {
 button:hover, a.download:hover { background: var(--button-hover); border-color: var(--accent); }
 button.dangerBtn { background: var(--danger-bg); border-color: color-mix(in srgb, var(--danger), var(--border)); color: var(--danger); }
 main { max-width: 1480px; margin: 0 auto; padding: 22px; }
-.boot { display: grid; min-height: 100vh; place-items: center; color: var(--muted); }
+.boot { display: grid; min-height: 100vh; place-items: center; color: var(--muted); padding: 24px; }
+.bootError { max-width: 520px; text-align: center; background: var(--panel); border: 1px solid color-mix(in srgb, var(--danger), var(--border)); border-radius: 14px; padding: 28px 32px; color: var(--text); }
+.bootError svg { color: var(--danger); }
+.bootError h2 { margin: 10px 0 6px; font-size: 18px; }
+.bootError p { margin: 6px 0; color: var(--muted); }
+.bootError .bootUrl code, .bootError .bootHint code { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 6px; word-break: break-all; }
+.bootError .bootHint { font-size: 13px; }
+.bootError button { margin-top: 14px; }
 .topbar { align-items: center; display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 18px; }
 .topbar > div:first-child { flex: 1 1 240px; }
 h1 { font-size: 30px; line-height: 1; margin: 0 0 6px; }
