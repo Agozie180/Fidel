@@ -70,6 +70,18 @@ docker compose up --build
 
 Railway builds the backend `Dockerfile` (see `railway.json`). The build context is trimmed by `.dockerignore` (no `frontend/`, no `node_modules/`) and the container runs a single uvicorn worker, so it stays well within a low-memory plan. Health checks hit `/healthz`. Set the environment variables from `.env.example` in the Railway dashboard. Deploy the `frontend/` separately (e.g. Railway static or Vercel) with `VITE_API_URL` pointing at the backend URL.
 
+The start command lives in `railway.json` (`deploy.startCommand`) and the `Dockerfile` `CMD` - both are identical and correct. **Do not set a "Custom Start Command" in the Railway dashboard.** A dashboard override takes precedence over `railway.json`, and a malformed value there cannot be fixed from this repo.
+
+### Troubleshooting: `/bin/sh: 1: =bnbaent: not found` (deploy fails, site won't load)
+
+This means the Railway service has a **Custom Start Command** whose first token is a stray environment assignment (e.g. `BNB_AGENT_SDK_COMMAND=bnbagent` saved with the variable name dropped, leaving `=bnbaent`). The shell tries to execute a program literally named `=bnbaent`, exits non-zero, uvicorn never starts, `/healthz` never passes, and the backend serves nothing - so the separately-hosted dashboard can't load data.
+
+Fix:
+
+1. Railway -> your backend service -> **Settings -> Deploy -> Custom Start Command**: clear the field (leave it empty) so `railway.json`'s `startCommand` applies. Redeploy.
+2. To pass an env value, set it as a real **Variable** in the dashboard - never as an inline `VAR=value` prefix on the start command.
+3. `BNB_AGENT_SDK_COMMAND` and `CMC_MCP_COMMAND` must each be a real executable on `PATH` or left **blank**. The backend now validates these and degrades to its native coordinator / data fallback instead of crashing if one is malformed, but a clean value avoids log noise.
+
 ## Live Mode
 
 Set `AUTONOMOUS_LIVE=true`. Fidel will then require real CMC Agent Hub/MCP data access, TWAK signing, BSC connectivity, wallet address, and PancakeSwap addresses. Private keys are read from environment variables and are never logged.
