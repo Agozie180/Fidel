@@ -2,6 +2,14 @@
 
 Fidel is a professional autonomous AI trading agent web application for BNB Hack AI Trading Agent Competition Track 1. It reads market data through CoinMarketCap Agent Hub paths, builds multi-confluence signals, applies strict competition risk gates, and executes BSC trades through Trust Wallet Agent Kit.
 
+## Execution & data modes (honest by design)
+
+- **LIVE** execution requires every credential: `AUTONOMOUS_LIVE=true`, `TRUST_WALLET_PRIVATE_KEY`, `TWAK_COMMAND`, and `PANCAKESWAP_V3_ROUTER`. TWAK signs real swaps locally.
+- **PAPER** execution runs automatically when any credential is missing. Trades are simulated with clearly-labelled tx hashes so the pipeline, logs, daily-trade requirement, and dashboard all work — Fidel never claims a live fill it did not make. The dashboard shows a LIVE/PAPER badge.
+- **Data**: CMC Agent Hub (key/MCP) is primary. With no CMC key, Fidel falls back to a free, key-less **real** price feed (Binance public spot, one batched call) and then to a deterministic model — instead of going dark. The active source is shown on the dashboard. Set `DATA_FALLBACK_ENABLED=false` to hard fail-closed in live mode.
+- The agent loop runs **server-side** and **auto-resumes after restarts** (`AUTO_START=true`, desired state persisted to `STATE_PATH`), so it keeps trading even if you close the browser or Railway restarts the container.
+- The **BNB AI Agent SDK** (`bnbagent`) is installed via `requirements.txt` and lazy-loaded only when a signing key is present, keeping idle memory low for Railway.
+
 ## Critical Competition Notes
 
 - Live trading window: June 22 to June 28, 2026.
@@ -57,6 +65,10 @@ Open `http://localhost:5173`.
 ```powershell
 docker compose up --build
 ```
+
+## Railway deployment
+
+Railway builds the backend `Dockerfile` (see `railway.json`). The build context is trimmed by `.dockerignore` (no `frontend/`, no `node_modules/`) and the container runs a single uvicorn worker, so it stays well within a low-memory plan. Health checks hit `/healthz`. Set the environment variables from `.env.example` in the Railway dashboard. Deploy the `frontend/` separately (e.g. Railway static or Vercel) with `VITE_API_URL` pointing at the backend URL.
 
 ## Live Mode
 

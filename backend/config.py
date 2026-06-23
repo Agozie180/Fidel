@@ -16,6 +16,10 @@ def _int(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
 
 
+def _bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     cmc_api_key: str = os.getenv("CMC_API_KEY", "")
@@ -44,13 +48,37 @@ class Settings:
     initial_portfolio_usdt: float = _float("INITIAL_PORTFOLIO_USDT", 1000)
     database_path: Path = Path(os.getenv("DATABASE_PATH", "data/fidel.sqlite3"))
     csv_path: Path = Path(os.getenv("CSV_PATH", "data/fidel_trades.csv"))
+    state_path: Path = Path(os.getenv("STATE_PATH", "data/agent_state.json"))
     competition_registration_deadline: str = os.getenv("COMPETITION_REGISTRATION_DEADLINE", "2026-06-21T23:59:59Z")
     competition_trading_start: str = os.getenv("COMPETITION_TRADING_START", "2026-06-22T00:00:00Z")
     competition_trading_end: str = os.getenv("COMPETITION_TRADING_END", "2026-06-28T23:59:59Z")
+    # --- Reliability / deployment ---
+    auto_start: bool = _bool("AUTO_START", True)
+    bnb_agent_sdk_enabled: bool = _bool("BNB_AGENT_SDK_ENABLED", True)
+    data_fallback_enabled: bool = _bool("DATA_FALLBACK_ENABLED", True)
+    public_price_feed: bool = _bool("PUBLIC_PRICE_FEED", True)
+    scan_concurrency: int = _int("SCAN_CONCURRENCY", 6)
+    scan_universe_csv: str = os.getenv("SCAN_UNIVERSE", "")
+    min_risk_reward: float = _float("MIN_RISK_REWARD", 1.8)
+    bsc_chain: str = os.getenv("BNB_NETWORK", "bsc")
 
     @property
     def llm_available(self) -> bool:
         return bool(self.anthropic_api_key or self.openai_api_key)
+
+    @property
+    def live_execution_ready(self) -> bool:
+        """True only when every credential for a real on-chain swap is present."""
+        return bool(
+            self.autonomous_live
+            and self.trust_wallet_private_key
+            and self.twak_command
+            and self.pancakeswap_v3_router
+        )
+
+    @property
+    def execution_mode(self) -> str:
+        return "LIVE" if self.live_execution_ready else "PAPER"
 
 
 settings = Settings()

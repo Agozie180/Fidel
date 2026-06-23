@@ -7,5 +7,6 @@ data/*.sqlite3
 data/*.csv
 data/*.log
 data/*.err
+data/agent_state.json
 frontend/node_modules/
 frontend/dist/

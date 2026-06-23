@@ -55,7 +55,7 @@ class ReasoningLayer:
             res = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": settings.anthropic_api_key, "anthropic-version": "2023-06-01"},
-                json={"model": "claude-3-5-sonnet-latest", "max_tokens": 300, "messages": [{"role": "user", "content": prompt}]},
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 300, "messages": [{"role": "user", "content": prompt}]},
             )
             res.raise_for_status()
             return res.json()["content"][0]["text"]
@@ -83,34 +83,67 @@ class FidelRuntime:
         self.registrar = CompetitionRegistrar()
         self.portfolio = PortfolioState(settings.initial_portfolio_usdt, settings.initial_portfolio_usdt)
         self.top_signals: list[Signal] = []
-        self.execution_preview: dict[str, Any] = {}
+        self.execution_preview: dict[str, Any] = self._waiting_preview("Agent stopped; press Start")
         self.activity: list[str] = []
         self.daily_trade_count: dict[str, int] = {}
         self.daily_window_trades: dict[str, dict[str, int]] = {}
         self._last_activity_by_key: dict[str, str] = {}
         self.last_error = ""
+        self._consecutive_errors = 0
+        self.data_source = "demo"
         self._task: asyncio.Task | None = None
         self._clients: set[WebSocket] = set()
 
+    # --- desired-state persistence (survives Railway restarts / OOM kills) ---
+    def _persist_state(self) -> None:
+        try:
+            settings.state_path.parent.mkdir(parents=True, exist_ok=True)
+            settings.state_path.write_text(
+                json.dumps({"desired_status": self.status, "updated_at": datetime.now(timezone.utc).isoformat()}),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence must never crash the agent
+            self.logger.log_event("WARNING", "state persist failed", {"error": str(exc)})
+
+    def _load_desired_status(self) -> str:
+        try:
+            if settings.state_path.exists():
+                return json.loads(settings.state_path.read_text(encoding="utf-8")).get("desired_status", "")
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
+
+    async def resume_if_desired(self) -> None:
+        """Called on server startup so the agent keeps running across restarts."""
+        desired = self._load_desired_status()
+        if desired == "RUNNING" or (settings.auto_start and desired != "STOPPED"):
+            self._log_activity("auto_resume", f"Auto-resuming agent (desired={desired or 'auto_start'})", force=True)
+            await self.start()
+
     async def start(self) -> None:
-        if self.status == "RUNNING":
+        if self.status == "RUNNING" and self._task and not self._task.done():
             return
         self.status = "RUNNING"
-        self._task = asyncio.create_task(self.loop())
+        self._persist_state()
+        if not self._task or self._task.done():
+            self._task = asyncio.create_task(self.loop())
         await self.broadcast()
 
     async def pause(self) -> None:
         self.status = "PAUSED"
+        self._persist_state()
         await self.broadcast()
 
     async def stop(self) -> None:
         self.status = "STOPPED"
+        self._persist_state()
         if self._task:
             self._task.cancel()
         await self.broadcast()
 
     async def emergency_stop(self, reason: str = "manual emergency stop") -> None:
         self.status = "STOPPED"
+        self._persist_state()
         self.portfolio.stopped = True
         self._log_activity("emergency_stop", f"EMERGENCY STOP: {reason}", force=True)
         self.logger.log_event("CRITICAL", "emergency stop activated", {"reason": reason})
@@ -125,20 +158,36 @@ class FidelRuntime:
                 continue
             try:
                 await self.tick()
-            except Exception as exc:
+                self._consecutive_errors = 0
+                self.last_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a single bad tick must not kill the loop
+                self._consecutive_errors += 1
                 self.last_error = str(exc)
-                self.status = "PAUSED" if settings.autonomous_live else self.status
-                self.logger.log_event("ERROR", "agent tick failed", {"error": self.last_error})
+                self.logger.log_event("ERROR", "agent tick failed", {"error": self.last_error, "streak": self._consecutive_errors})
+                self._log_activity("tick_error", f"Tick error ({self._consecutive_errors}): {self.last_error}")
             await self.broadcast()
-            await asyncio.sleep(settings.trade_interval_seconds)
+            # Exponential backoff on a run of errors, capped, instead of giving up.
+            interval = settings.trade_interval_seconds
+            if self._consecutive_errors:
+                interval = min(settings.trade_interval_seconds * (2 ** min(self._consecutive_errors, 4)), 600)
+            await asyncio.sleep(interval)
+
+    @staticmethod
+    def _waiting_preview(message: str) -> dict[str, Any]:
+        return {"approved": False, "venue": "PancakeSwap V3 on BSC", "route": [], "warnings": [message], "mode": settings.execution_mode}
 
     async def tick(self) -> None:
         await self.bnb.heartbeat()
         self.top_signals = (await self.signal_engine.scan())[:10]
         prices = {s.symbol: s.price for s in self.top_signals}
         self.portfolio.mark_to_market(prices)
+        if self.top_signals:
+            self.data_source = self.top_signals[0].data_source
         if not self.top_signals:
-            self._log_activity("cmc_feed", "No CMC signals available")
+            self.execution_preview = self._waiting_preview("No market data available from CMC or fallback feed")
+            self._log_activity("cmc_feed", "No market signals available from any data source")
             return
         now = datetime.now(timezone.utc)
         day = now.date().isoformat()
@@ -150,17 +199,24 @@ class FidelRuntime:
         selected = self.top_signals[0]
         selected.reasoning = await self.reasoning.explain(selected, self.top_signals[1:])
         decision = self.risk.evaluate(selected, self.portfolio)
+        route = ["USDT", selected.symbol] if selected.direction == "BUY" else [selected.symbol, "USDT"]
         if decision.approved:
             self.execution_preview = asdict(self.executor.preview_swap(selected, decision))
         else:
-            self.execution_preview = {"approved": False, "warnings": [decision.reason], "venue": "none"}
+            self.execution_preview = {
+                "approved": False,
+                "venue": "PancakeSwap V3 on BSC",
+                "route": route,
+                "warnings": [decision.reason],
+                "mode": settings.execution_mode,
+            }
         self._log_activity("trade_decision", f"{selected.symbol} {selected.direction} {selected.confidence}% {selected.strength} in {window}: {decision.reason}")
         if not decision.approved:
             self.logger.log_event("INFO", "trade rejected by risk layer", {"symbol": selected.symbol, "reason": decision.reason})
             return
         if not self._window_trade_available(day, window):
             reason = f"{window} UTC trade window already used for {day}; waiting for next window"
-            self.execution_preview = {"approved": False, "warnings": [reason], "venue": "window throttle"}
+            self.execution_preview = {"approved": False, "venue": "PancakeSwap V3 on BSC", "route": route, "warnings": [reason], "mode": settings.execution_mode}
             self._log_activity(f"window_throttle:{day}:{window}", reason)
             self.logger.log_event("INFO", "trade rejected by window throttle", {"date": day, "window": window, "symbol": selected.symbol})
             return
@@ -168,7 +224,7 @@ class FidelRuntime:
         result = await self.executor.execute_swap(selected, decision, self.portfolio)
         if result.status not in {"confirmed", "submitted"}:
             reason = f"Execution rejected for {selected.symbol}: {result.message}"
-            self.execution_preview = {"approved": False, "warnings": [reason], "venue": "execution"}
+            self.execution_preview = {"approved": False, "venue": "PancakeSwap V3 on BSC", "route": route, "warnings": [reason], "mode": settings.execution_mode}
             self._log_activity("execution_rejected", reason)
             self.logger.log_event("WARNING", "execution rejected", {"symbol": selected.symbol, "message": result.message})
             return
@@ -225,16 +281,26 @@ class FidelRuntime:
         closed = [t for t in trades if float(t.get("pnl_usdt") or 0) != 0]
         has_bsc_hashes = any(str(t.get("bsc_tx_hash") or "").startswith("0x") for t in trades)
         token_registry = registry.status()
+        bnb_ready = self.bnb.integration_ready
         judging = build_judging_readiness(
             registry_status=token_registry,
             trade_count=len(trades),
             today_trades=self.daily_trade_count.get(today, 0),
             has_bsc_hashes=has_bsc_hashes,
+            bnb_ready=bnb_ready,
         ).to_dict()
         drawdown_left = max(0, settings.max_drawdown_pct - self.portfolio.drawdown_pct)
         minimum_trade_deadline = f"{today}T20:00:00Z"
         return {
-            "agent": {"name": "Fidel", "status": self.status, "wallet": settings.agent_wallet_address, "last_error": self.last_error},
+            "agent": {
+                "name": "Fidel",
+                "status": self.status,
+                "wallet": settings.agent_wallet_address,
+                "last_error": self.last_error,
+                "execution_mode": settings.execution_mode,
+                "data_source": self.data_source,
+                "background": bool(self._task and not self._task.done()),
+            },
             "portfolio": {
                 "value": value,
                 "starting_value": self.portfolio.starting_value,
@@ -269,10 +335,12 @@ class FidelRuntime:
             "compliance": {
                 "cmc_agent_hub": bool(settings.cmc_api_key or settings.cmc_mcp_command),
                 "twak": bool(settings.twak_command),
-                "bnb_ai_agent_sdk": bool(settings.bnb_agent_sdk_command),
+                "bnb_ai_agent_sdk": bnb_ready,
                 "llm_reasoning": settings.llm_available,
                 "autonomous_live": settings.autonomous_live,
                 "strict_live_contracts": settings.strict_live_token_contracts,
+                "execution_mode": settings.execution_mode,
+                "data_source": self.data_source,
             },
             "session": self.top_signals[0].session if self.top_signals else "unknown",
             "min_confidence": self.top_signals[0].session_min_confidence if self.top_signals else settings.min_signal_confidence,
@@ -356,6 +424,15 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Fidel Autonomous AI Trading Agent", version="1.0.0")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
     app.include_router(router, prefix="/api")
+
+    @app.on_event("startup")
+    async def _resume_agent() -> None:
+        # Keep trading across restarts/OOM kills and without the browser open.
+        await runtime.resume_if_desired()
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok", "agent": runtime.status, "mode": settings.execution_mode}
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

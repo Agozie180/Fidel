@@ -18,6 +18,7 @@ class ExecutionResult:
     status: str
     tx_hash: str
     message: str
+    mode: str = "PAPER"
 
 
 @dataclass(frozen=True)
@@ -32,28 +33,42 @@ class ExecutionPreview:
     price_impact_pct: float
     token_address: str
     warnings: list[str]
+    mode: str = "PAPER"
 
 
 class TrustWalletExecutor:
-    """TWAK-only execution adapter. Live mode requires TWAK CLI/MCP to sign locally."""
+    """Trust Wallet Agent Kit execution adapter.
+
+    Runs in one of two honest modes:
+      * LIVE  - every credential present (autonomous, private key, TWAK binary,
+                PancakeSwap router). Real swaps are signed locally by TWAK.
+      * PAPER - any credential missing. Trades are simulated with a clearly
+                labelled deterministic hash so the pipeline, logs and daily-trade
+                requirement still work, but Fidel never claims a live fill it
+                did not make.
+    """
 
     def __init__(self, cfg: Settings = settings) -> None:
         self.cfg = cfg
 
     async def execute_swap(self, signal: Signal, risk: RiskDecision, portfolio: PortfolioState) -> ExecutionResult:
-        validate_token(signal.symbol, require_contract=self.cfg.autonomous_live and self.cfg.strict_live_token_contracts)
+        mode = self.cfg.execution_mode
+        validate_token(signal.symbol, require_contract=self.cfg.live_execution_ready and self.cfg.strict_live_token_contracts)
         if not risk.approved:
-            return ExecutionResult("rejected", "", risk.reason)
+            return ExecutionResult("rejected", "", risk.reason, mode)
         preview = self.preview_swap(signal, risk)
         if not preview.approved:
-            return ExecutionResult("rejected", "", "execution preflight rejected route: " + "; ".join(preview.warnings))
-        if self.cfg.autonomous_live:
+            return ExecutionResult("rejected", "", "execution preflight rejected route: " + "; ".join(preview.warnings), mode)
+        if self.cfg.live_execution_ready:
             return await self._twak_swap(signal, risk)
         payload = f"{signal.symbol}:{signal.direction}:{signal.price}:{datetime.now(timezone.utc).isoformat()}"
-        return ExecutionResult("confirmed", "0x" + hashlib.sha256(payload.encode()).hexdigest(), "development execution simulated; live mode uses TWAK")
+        tx_hash = "0x" + hashlib.sha256(payload.encode()).hexdigest()
+        return ExecutionResult("confirmed", tx_hash, "PAPER fill (no live TWAK credentials); set keys to trade live", "PAPER")
 
     def preview_swap(self, signal: Signal, risk: RiskDecision) -> ExecutionPreview:
-        token = registry.validate(signal.symbol, require_contract=self.cfg.autonomous_live and self.cfg.strict_live_token_contracts)
+        mode = self.cfg.execution_mode
+        require_contract = self.cfg.live_execution_ready and self.cfg.strict_live_token_contracts
+        token = registry.validate(signal.symbol, require_contract=require_contract)
         liquidity = int(signal.cmc_snapshot.get("liquidity_score", 70))
         volatility = float(getattr(signal, "volatility_pct", 1.0))
         estimated_slippage = max(8, int((100 - liquidity) * 1.4 + volatility * 5))
@@ -64,7 +79,7 @@ class TrustWalletExecutor:
             warnings.append(f"estimated slippage {estimated_slippage} bps exceeds {self.cfg.max_slippage_bps} bps")
         if gas_usdt > self.cfg.max_gas_usdt:
             warnings.append(f"estimated gas ${gas_usdt:.2f} exceeds ${self.cfg.max_gas_usdt:.2f}")
-        if self.cfg.autonomous_live and not token.address:
+        if self.cfg.live_execution_ready and not token.address:
             warnings.append("missing BSC token contract")
         return ExecutionPreview(
             approved=not warnings,
@@ -77,6 +92,7 @@ class TrustWalletExecutor:
             price_impact_pct=price_impact,
             token_address=token.address,
             warnings=warnings,
+            mode=mode,
         )
 
     async def _twak_swap(self, signal: Signal, risk: RiskDecision) -> ExecutionResult:
@@ -103,7 +119,7 @@ class TrustWalletExecutor:
         if proc.returncode != 0:
             raise RuntimeError(f"TWAK execution failed: {err.decode().strip()}")
         data = json.loads(out.decode())
-        return ExecutionResult(data.get("status", "submitted"), data.get("tx_hash", ""), data.get("message", "TWAK swap submitted"))
+        return ExecutionResult(data.get("status", "submitted"), data.get("tx_hash", ""), data.get("message", "TWAK swap submitted"), "LIVE")
 
     def apply_fill(self, signal: Signal, risk: RiskDecision, result: ExecutionResult, portfolio: PortfolioState) -> None:
         if result.status not in {"confirmed", "submitted"}:
@@ -114,12 +130,80 @@ class TrustWalletExecutor:
 
 
 class BnbAgentCoordinator:
+    """BNB AI Agent SDK lifecycle coordinator.
+
+    Prefers the official ``bnbagent`` Python SDK (lazy-imported so web3 is only
+    loaded when actually enabled, keeping idle memory low). Falls back to a CLI
+    command, then to the native Python coordinator.
+    """
+
     def __init__(self, cfg: Settings = settings) -> None:
         self.cfg = cfg
+        self._sdk = None
+        self._sdk_error = ""
+        self._sdk_tried = False
+
+    @property
+    def sdk_available(self) -> bool:
+        return self._sdk is not None
+
+    def _init_sdk(self):
+        # web3 is only loaded here, and only when a private key is present, so
+        # PAPER mode on Railway never pays the ~35 MB web3 import cost.
+        if self._sdk_tried:
+            return self._sdk
+        self._sdk_tried = True
+        if not (self.cfg.bnb_agent_sdk_enabled and self.cfg.trust_wallet_private_key):
+            return None
+        try:
+            from bnbagent import BNBAgent, BNBAgentConfig  # lazy import (pulls web3)
+
+            config = BNBAgentConfig(
+                network=self.cfg.bsc_chain,
+                private_key=self.cfg.trust_wallet_private_key,
+                wallet_address=self.cfg.agent_wallet_address,
+            )
+            self._sdk = BNBAgent(config)
+        except Exception as exc:  # noqa: BLE001 - never let SDK init crash the agent
+            self._sdk = None
+            self._sdk_error = str(exc)
+        return self._sdk
 
     async def heartbeat(self) -> str:
-        if not self.cfg.bnb_agent_sdk_command:
-            return "BNB AI Agent SDK command not configured; lifecycle running in native Python coordinator"
-        proc = await asyncio.create_subprocess_shell(f"{self.cfg.bnb_agent_sdk_command} heartbeat --chain bsc", stdout=asyncio.subprocess.PIPE)
-        out, _ = await proc.communicate()
-        return out.decode().strip() or "BNB SDK heartbeat sent"
+        # Live signing path: initialise the real SDK only when a key exists.
+        if self.cfg.bnb_agent_sdk_enabled and self.cfg.trust_wallet_private_key:
+            sdk = await asyncio.to_thread(self._init_sdk)
+            if sdk is not None:
+                wallet = self.cfg.agent_wallet_address or "unsigned"
+                return f"BNB AI Agent SDK {self._sdk_version()} live on {self.cfg.bsc_chain} (wallet {wallet})"
+            if self._sdk_error:
+                return f"BNB SDK not initialised ({self._sdk_error}); native coordinator active"
+        version = self._sdk_version()
+        if version:
+            return f"BNB AI Agent SDK (bnbagent {version}) installed and enabled; idle until live credentials are set"
+        if self.cfg.bnb_agent_sdk_command:
+            proc = await asyncio.create_subprocess_shell(f"{self.cfg.bnb_agent_sdk_command} heartbeat --chain bsc", stdout=asyncio.subprocess.PIPE)
+            out, _ = await proc.communicate()
+            return out.decode().strip() or "BNB SDK heartbeat sent"
+        return "BNB AI Agent SDK not installed; lifecycle running in native Python coordinator"
+
+    @staticmethod
+    def _sdk_version() -> str:
+        # Read version via metadata - does NOT import bnbagent/web3.
+        try:
+            import importlib.metadata as md
+
+            return md.version("bnbagent")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @property
+    def integration_ready(self) -> bool:
+        """True when the SDK is installed/enabled. Uses find_spec so it never imports web3."""
+        if not self.cfg.bnb_agent_sdk_enabled:
+            return bool(self.cfg.bnb_agent_sdk_command)
+        import importlib.util
+
+        if importlib.util.find_spec("bnbagent") is not None:
+            return True
+        return bool(self.cfg.bnb_agent_sdk_command)

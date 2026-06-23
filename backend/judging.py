@@ -42,11 +42,14 @@ def build_judging_readiness(
     trade_count: int,
     today_trades: int,
     has_bsc_hashes: bool,
+    bnb_ready: bool | None = None,
 ) -> JudgingReadiness:
+    if bnb_ready is None:
+        bnb_ready = bool(cfg.bnb_agent_sdk_command)
     items = [
         _item("CMC Agent Hub + x402", 15, bool(cfg.cmc_api_key or cfg.cmc_mcp_command), "CMC key/MCP command configured"),
         _item("Trust Wallet Agent Kit execution", 15, bool(cfg.twak_command), f"TWAK command: {cfg.twak_command or 'missing'}"),
-        _item("BNB AI Agent SDK lifecycle", 10, bool(cfg.bnb_agent_sdk_command), "BNB SDK heartbeat command configured"),
+        _item("BNB AI Agent SDK lifecycle", 10, bnb_ready, "BNB AI Agent SDK (bnbagent) installed/enabled"),
         _item("LLM reasoning layer", 10, cfg.llm_available, "Anthropic or OpenAI API key configured"),
         _item("Strict BSC token registry", 15, registry_status.get("contract_ready", 0) > 0 and cfg.strict_live_token_contracts, f"{registry_status.get('contract_ready', 0)} contract-ready tokens"),
         _item("Risk gate implementation", 15, True, "2% position cap, 25% hard drawdown, daily loss, ATR stops, 3-position cap"),

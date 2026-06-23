@@ -1,10 +1,7 @@
-aiohttp==3.13.5
+# Runtime dependencies only - kept lean for low-memory Railway deploys.
+# aiohttp / python-telegram-bot / python-dotenv were unused and removed.
 fastapi==0.115.6
 httpx==0.28.1
-python-dotenv==1.0.1
-python-telegram-bot==22.7
-pytest==8.3.2
-pytest-asyncio==0.25.0
-uvicorn[standard]==0.34.0
+uvicorn==0.34.0
 websockets==14.2
-bnbagent
+bnbagent==0.3.6

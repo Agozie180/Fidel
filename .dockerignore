@@ -1,0 +1,17 @@
+# Keep the Docker build context tiny (avoids slow/OOM Railway builds).
+frontend/
+**/node_modules/
+.git/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+data/*.sqlite3
+data/*.csv
+data/*.log
+data/*.err
+data/agent_state.json
+tests/
+*.md
+.env

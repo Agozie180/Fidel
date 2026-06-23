@@ -58,9 +58,11 @@ function App() {
       <header className="topbar">
         <div>
           <h1>Fidel</h1>
-          <p>Autonomous AI Trading Agent for BNB Hack Track 1</p>
+          <p>Autonomous AI Trading Agent for BNB Hack Track 1 · data: {state.agent.data_source || "—"}</p>
         </div>
         <div className={`status ${state.agent.status.toLowerCase()}`}><Radio size={16} />{state.agent.status}</div>
+        <div className={`mode ${(state.agent.execution_mode || "PAPER") === "LIVE" ? "live" : "paper"}`} title="Execution mode">{state.agent.execution_mode || "PAPER"}</div>
+        {state.agent.background && <div className="mode bg" title="Trading loop runs server-side, even if you close the browser">BG</div>}
         <button title="Start agent" onClick={() => action("/api/agent/start")}><Play size={18} />Start</button>
         <button title="Pause agent" onClick={() => action("/api/agent/pause")}><Pause size={18} />Pause</button>
         <button title="Stop agent" onClick={() => action("/api/agent/stop")}><Power size={18} />Stop</button>
@@ -146,7 +148,7 @@ function App() {
           <div className={`preflight ${state.execution_preview.approved ? "yes" : "no"}`}>
             <Route size={22} />
             <div>
-              <strong>{state.execution_preview.venue || "No route selected"}</strong>
+              <strong>{state.execution_preview.venue || "PancakeSwap V3 on BSC"} · {state.execution_preview.mode || state.agent.execution_mode || "PAPER"}</strong>
               <span>{(state.execution_preview.route || []).join(" -> ") || "Waiting for approved signal"}</span>
             </div>
             <b>{state.execution_preview.approved ? "APPROVED" : "BLOCKED"}</b>

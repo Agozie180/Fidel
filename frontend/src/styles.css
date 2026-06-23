@@ -67,11 +67,16 @@ button:hover, a.download:hover { background: var(--button-hover); border-color: 
 button.dangerBtn { background: var(--danger-bg); border-color: color-mix(in srgb, var(--danger), var(--border)); color: var(--danger); }
 main { max-width: 1480px; margin: 0 auto; padding: 22px; }
 .boot { display: grid; min-height: 100vh; place-items: center; color: var(--muted); }
-.topbar { align-items: center; display: grid; gap: 12px; grid-template-columns: 1fr auto auto auto auto auto auto; margin-bottom: 18px; }
+.topbar { align-items: center; display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 18px; }
+.topbar > div:first-child { flex: 1 1 240px; }
 h1 { font-size: 30px; line-height: 1; margin: 0 0 6px; }
 p { margin: 0; }
 .topbar p, small, .metric span { color: var(--muted); }
 .status { align-items: center; border-radius: 999px; display: flex; gap: 8px; padding: 9px 12px; font-weight: 700; }
+.mode { align-items: center; border-radius: 999px; display: flex; font-weight: 800; font-size: 12px; letter-spacing: 0.5px; padding: 9px 12px; }
+.mode.live { background: var(--success-bg); color: var(--success); }
+.mode.paper { background: var(--warning-bg); color: var(--warning); }
+.mode.bg { background: var(--success-bg); color: var(--success); }
 .status.running { background: var(--success-bg); color: var(--success); }
 .status.paused { background: var(--warning-bg); color: var(--warning); }
 .status.stopped { background: var(--danger-bg); color: var(--danger); }

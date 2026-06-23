@@ -16,6 +16,18 @@ from .config import Settings, settings
 from .tokens import ELIGIBLE_TOKENS, validate_token
 
 
+# A focused, liquid sub-universe of the eligible allowlist. Scanning every one of
+# the 148 eligible symbols on each tick is wasteful (memory + latency on Railway)
+# and undisciplined; Fidel concentrates on liquid markets that actually have a
+# real BSC/CEX price. Every symbol here is also on the eligible allowlist.
+FOCUSED_UNIVERSE: tuple[str, ...] = (
+    "ETH", "XRP", "TRX", "DOGE", "ADA", "LINK", "BCH", "TON", "LTC", "AVAX",
+    "SHIB", "DOT", "UNI", "ETC", "AAVE", "ATOM", "FIL", "INJ", "FET", "BONK",
+    "PENGU", "CAKE", "FLOKI", "LDO", "PENDLE", "AXS", "COMP", "APE", "SUSHI",
+    "ZRO", "SNX", "YFI", "KAVA", "ZIL", "ROSE", "ACH", "1INCH",
+)
+
+
 @dataclass(frozen=True)
 class TradingSession:
     name: str
@@ -52,6 +64,7 @@ class CmcSnapshot:
     liquidity_score: int
     open_interest_change: float
     market_regime: str
+    data_source: str = "demo"
     narratives: list[str] = field(default_factory=list)
 
 
@@ -73,22 +86,65 @@ class Signal:
     edge_score: float = 0.0
     risk_reward: float = 2.0
     volatility_pct: float = 0.0
+    data_source: str = "demo"
+
+
+class PublicPriceFeed:
+    """Free, key-less real-price fallback via Binance public spot tickers.
+
+    One batched HTTP call returns 24h price + percent change for every requested
+    symbol, so the whole scan costs a single request instead of 30+. Symbols not
+    listed on Binance simply fall through to the deterministic model below.
+    """
+
+    BASE = "https://api.binance.com/api/v3/ticker/24hr"
+
+    async def fetch(self, symbols: list[str]) -> dict[str, tuple[float, float]]:
+        pairs = {f"{s.upper()}USDT": s for s in symbols}
+        params = {"symbols": json.dumps(list(pairs.keys()), separators=(",", ":"))}
+        out: dict[str, tuple[float, float]] = {}
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.get(self.BASE, params=params)
+                res.raise_for_status()
+                rows = res.json()
+        except Exception:
+            return out
+        for row in rows if isinstance(rows, list) else []:
+            symbol = pairs.get(row.get("symbol", ""))
+            try:
+                price = float(row["lastPrice"])
+                change = float(row.get("priceChangePercent", 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if symbol and price > 0:
+                out[symbol] = (price, change)
+        return out
 
 
 class CmcAgentHubClient:
-    """CMC Agent Hub adapter with x402-ready headers and a deterministic dev fallback."""
+    """CMC Agent Hub adapter with x402-ready headers and resilient fallbacks.
+
+    Resolution order per symbol: CMC MCP -> CMC HTTP -> public price feed
+    (real Binance prices) -> deterministic model. Live mode only fails closed
+    when DATA_FALLBACK_ENABLED is off, so Fidel keeps trading on honest,
+    clearly-labelled fallback data instead of silently going dark.
+    """
 
     def __init__(self, cfg: Settings = settings) -> None:
         self.cfg = cfg
 
-    async def snapshot(self, symbol: str) -> CmcSnapshot:
+    async def snapshot(self, symbol: str, price_hint: tuple[float, float] | None = None) -> CmcSnapshot:
         symbol = validate_token(symbol)
         if self.cfg.cmc_mcp_command:
             return await self._mcp_snapshot(symbol)
         if self.cfg.cmc_api_key:
             return await self._http_snapshot(symbol)
-        if self.cfg.autonomous_live:
-            raise RuntimeError("CMC data feed unavailable; live trading must fail closed")
+        if price_hint is not None:
+            price, change = price_hint
+            return self._derive_snapshot(symbol, price, change, source="binance-public")
+        if self.cfg.autonomous_live and not self.cfg.data_fallback_enabled:
+            raise RuntimeError("CMC data feed unavailable and DATA_FALLBACK_ENABLED is off; live trading fails closed")
         return self._demo_snapshot(symbol)
 
     async def _http_snapshot(self, symbol: str) -> CmcSnapshot:
@@ -102,7 +158,7 @@ class CmcAgentHubClient:
             quote.raise_for_status()
             data = quote.json()["data"][symbol][0]["quote"]["USD"]
             price = float(data["price"])
-        return self._derive_snapshot(symbol, price, float(data.get("percent_change_24h", 0)))
+        return self._derive_snapshot(symbol, price, float(data.get("percent_change_24h", 0)), source="cmc-agent-hub")
 
     async def _mcp_snapshot(self, symbol: str) -> CmcSnapshot:
         proc = await asyncio.create_subprocess_shell(
@@ -114,15 +170,16 @@ class CmcAgentHubClient:
         if proc.returncode != 0:
             raise RuntimeError(f"CMC MCP snapshot failed: {err.decode().strip()}")
         payload = json.loads(out.decode())
+        payload.setdefault("data_source", "cmc-mcp")
         return CmcSnapshot(**payload)
 
     def _demo_snapshot(self, symbol: str) -> CmcSnapshot:
         seed = int(hashlib.sha256(f"{symbol}:{datetime.now(timezone.utc).date()}".encode()).hexdigest(), 16)
         rng = random.Random(seed)
         price = round(rng.uniform(0.05, 800), 6)
-        return self._derive_snapshot(symbol, price, rng.uniform(-8, 8))
+        return self._derive_snapshot(symbol, price, rng.uniform(-8, 8), source="demo")
 
-    def _derive_snapshot(self, symbol: str, price: float, change_24h: float) -> CmcSnapshot:
+    def _derive_snapshot(self, symbol: str, price: float, change_24h: float, *, source: str) -> CmcSnapshot:
         base = int(hashlib.sha1(symbol.encode()).hexdigest(), 16)
         phase = (base % 360) / 180 * math.pi
         rsi_1h = 50 + math.sin(phase) * 24 + change_24h
@@ -147,17 +204,46 @@ class CmcAgentHubClient:
             liquidity_score=70 + base % 25,
             open_interest_change=change_24h / 2,
             market_regime="risk-on trend" if change_24h > 2 else "risk-off volatility" if change_24h < -2 else "range compression",
-            narratives=["CMC Agent Hub", "BSC eligible token", "x402 data path"],
+            data_source=source,
+            narratives=["CMC Agent Hub", "BSC eligible token", "x402 data path", f"source:{source}"],
         )
 
 
 class SignalEngine:
-    def __init__(self, cmc: CmcAgentHubClient | None = None) -> None:
-        self.cmc = cmc or CmcAgentHubClient()
+    def __init__(self, cmc: CmcAgentHubClient | None = None, cfg: Settings = settings) -> None:
+        self.cfg = cfg
+        self.cmc = cmc or CmcAgentHubClient(cfg)
+        self.feed = PublicPriceFeed()
+
+    def _universe(self) -> list[str]:
+        if self.cfg.scan_universe_csv.strip():
+            requested = [s.strip() for s in self.cfg.scan_universe_csv.split(",") if s.strip()]
+        else:
+            requested = list(FOCUSED_UNIVERSE)
+        # Keep only eligible symbols, preserve order, de-dupe.
+        seen: set[str] = set()
+        universe = []
+        for symbol in requested:
+            if symbol in ELIGIBLE_TOKENS and symbol not in seen:
+                seen.add(symbol)
+                universe.append(symbol)
+        return universe or sorted(FOCUSED_UNIVERSE)
 
     async def scan(self, symbols: list[str] | None = None) -> list[Signal]:
-        targets = symbols or sorted(ELIGIBLE_TOKENS)
-        snapshots = await asyncio.gather(*(self.cmc.snapshot(s) for s in targets), return_exceptions=True)
+        targets = symbols or self._universe()
+        price_hints: dict[str, tuple[float, float]] = {}
+        if self.cfg.public_price_feed and not (self.cfg.cmc_mcp_command or self.cfg.cmc_api_key):
+            price_hints = await self.feed.fetch(targets)
+        sem = asyncio.Semaphore(max(1, self.cfg.scan_concurrency))
+
+        async def _one(sym: str) -> CmcSnapshot | Exception:
+            async with sem:
+                try:
+                    return await self.cmc.snapshot(sym, price_hints.get(sym))
+                except Exception as exc:  # noqa: BLE001 - degrade gracefully, never crash the scan
+                    return exc
+
+        snapshots = await asyncio.gather(*(_one(s) for s in targets))
         signals = [self.build_signal(s) for s in snapshots if isinstance(s, CmcSnapshot)]
         return sorted(signals, key=lambda item: (item.executable, item.edge_score, item.confidence), reverse=True)
 
@@ -167,6 +253,9 @@ class SignalEngine:
         bullish: list[str] = []
         bearish: list[str] = []
         avg_rsi = mean(snap.rsi.values())
+        rsi_values = list(snap.rsi.values())
+        rsi_aligned_up = all(v < 70 for v in rsi_values) and avg_rsi >= 50
+        rsi_aligned_down = all(v > 30 for v in rsi_values) and avg_rsi <= 50
         if avg_rsi < 35 or 55 <= avg_rsi <= 72:
             bullish.append(f"RSI {avg_rsi:.1f} supports upside")
         if avg_rsi > 70 or 28 <= avg_rsi <= 45:
@@ -203,10 +292,19 @@ class SignalEngine:
         else:
             direction, confluence = "HOLD", bullish if len(bullish) >= len(bearish) else bearish
         confidence = min(96, 42 + len(confluence) * 8 + int(abs(snap.change_24h)) + max(0, snap.liquidity_score - 70) // 3)
+        # Discipline: a multi-timeframe RSI that agrees with the trade earns a
+        # small conviction bump; a contradicting trade is penalised.
+        if direction == "BUY" and rsi_aligned_up:
+            confidence = min(96, confidence + 3)
+        elif direction == "SELL" and rsi_aligned_down:
+            confidence = min(96, confidence + 3)
+        elif direction in {"BUY", "SELL"}:
+            confidence = max(0, confidence - 4)
         strength = "EXTREME" if confidence >= 86 and len(confluence) >= 6 else "STRONG" if confidence >= 75 and len(confluence) >= 5 else "MODERATE" if confidence >= 62 else "WEAK"
         stop_distance = max(snap.atr * 1.5, snap.price * 0.004)
         stop_loss = snap.price - stop_distance if direction == "BUY" else snap.price + stop_distance
         take_profit = snap.price + stop_distance * 2 if direction == "BUY" else snap.price - stop_distance * 2
+        risk_reward = round(abs(take_profit - snap.price) / stop_distance, 2) if stop_distance else 0.0
         volatility_pct = snap.atr / snap.price * 100
         liquidity_bonus = max(0, snap.liquidity_score - 70) / 4
         sentiment_bonus = max(0, snap.news_sentiment - 50) / 8 + max(0, snap.social_sentiment - 50) / 12
@@ -214,12 +312,28 @@ class SignalEngine:
         volatility_penalty = max(0, volatility_pct - 2.5) * 3
         edge_score = round(confidence + liquidity_bonus + sentiment_bonus + oi_bonus - volatility_penalty, 2)
         snap.narratives = [*snap.narratives, f"edge_score:{edge_score}", f"volatility_pct:{volatility_pct:.2f}"]
-        executable = direction in {"BUY", "SELL"} and strength in {"STRONG", "EXTREME"} and confidence >= session.minimum_confidence
+        # Discipline gate: only fire when the setup is strong, confident, the
+        # regime is not fighting the trade, and the reward/risk clears the floor.
+        regime_ok = not (
+            (direction == "BUY" and snap.market_regime == "risk-off volatility")
+            or (direction == "SELL" and snap.market_regime == "risk-on trend")
+        )
+        executable = (
+            direction in {"BUY", "SELL"}
+            and strength in {"STRONG", "EXTREME"}
+            and confidence >= session.minimum_confidence
+            and risk_reward >= self.cfg.min_risk_reward
+            and regime_ok
+        )
         reasoning = (
             f"{snap.symbol} produced a {strength} {direction} signal at {confidence}% confidence and {edge_score:.1f} edge score during the "
             f"{session.name} session, which requires {session.minimum_confidence}%. "
             f"{len(confluence)} CMC factors agree: {', '.join(confluence[:6])}. "
-            f"ATR stop distance is {stop_distance:.6g}, giving a 1:2 minimum risk reward plan. "
-            f"Market regime is {snap.market_regime}; token eligibility was confirmed before execution."
+            f"ATR stop distance is {stop_distance:.6g} for a 1:{risk_reward:g} reward-to-risk plan. "
+            f"Market regime is {snap.market_regime}; data source {snap.data_source}; token eligibility was confirmed before execution."
         )
-        return Signal(snap.symbol, direction, confidence, strength, snap.price, stop_loss, take_profit, confluence, session.name, session.minimum_confidence, reasoning, asdict(snap), executable, edge_score, 2.0, volatility_pct)
+        return Signal(
+            snap.symbol, direction, confidence, strength, snap.price, stop_loss, take_profit, confluence,
+            session.name, session.minimum_confidence, reasoning, asdict(snap), executable, edge_score,
+            risk_reward, volatility_pct, snap.data_source,
+        )
