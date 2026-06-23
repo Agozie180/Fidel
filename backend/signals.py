@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from .config import Settings, settings
+from .proc import ToolCommandError, run_tool_command
 from .tokens import ELIGIBLE_TOKENS, validate_token
 
 
@@ -161,15 +162,18 @@ class CmcAgentHubClient:
         return self._derive_snapshot(symbol, price, float(data.get("percent_change_24h", 0)), source="cmc-agent-hub")
 
     async def _mcp_snapshot(self, symbol: str) -> CmcSnapshot:
-        proc = await asyncio.create_subprocess_shell(
-            f'{self.cfg.cmc_mcp_command} snapshot {symbol} --x402',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"CMC MCP snapshot failed: {err.decode().strip()}")
-        payload = json.loads(out.decode())
+        # Safe exec: a misconfigured CMC_MCP_COMMAND raises a clear error (caught
+        # by scan()'s per-symbol guard) instead of detonating in /bin/sh.
+        try:
+            result = await run_tool_command(self.cfg.cmc_mcp_command, "snapshot", symbol, "--x402")
+        except ToolCommandError as exc:
+            raise RuntimeError(f"CMC MCP command misconfigured: {exc}") from exc
+        if result is None:
+            raise RuntimeError("CMC MCP command not configured")
+        returncode, out, err = result
+        if returncode != 0:
+            raise RuntimeError(f"CMC MCP snapshot failed: {err}")
+        payload = json.loads(out)
         payload.setdefault("data_source", "cmc-mcp")
         return CmcSnapshot(**payload)
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .config import Settings, settings
+from .proc import ToolCommandError, run_tool_command
 from .risk import PortfolioState, Position, RiskDecision
 from .signals import Signal
 from .tokens import validate_token
@@ -182,9 +183,15 @@ class BnbAgentCoordinator:
         if version:
             return f"BNB AI Agent SDK (bnbagent {version}) installed and enabled; idle until live credentials are set"
         if self.cfg.bnb_agent_sdk_command:
-            proc = await asyncio.create_subprocess_shell(f"{self.cfg.bnb_agent_sdk_command} heartbeat --chain bsc", stdout=asyncio.subprocess.PIPE)
-            out, _ = await proc.communicate()
-            return out.decode().strip() or "BNB SDK heartbeat sent"
+            # Run the optional CLI safely: a malformed value (e.g. a stray
+            # "=bnbaent" from a dashboard typo) raises instead of hitting /bin/sh.
+            try:
+                result = await run_tool_command(self.cfg.bnb_agent_sdk_command, "heartbeat", "--chain", "bsc")
+            except ToolCommandError as exc:
+                return f"BNB SDK command misconfigured ({exc}); native coordinator active"
+            if result is not None:
+                _, out, _ = result
+                return out or "BNB SDK heartbeat sent"
         return "BNB AI Agent SDK not installed; lifecycle running in native Python coordinator"
 
     @staticmethod
